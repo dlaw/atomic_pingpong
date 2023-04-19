@@ -5,9 +5,9 @@
 //! writing by the producer, and the other element is reserved for reading by
 //! the consumer. When writing and reading are finished, the roles of the two
 //! elements are swapped (i.e. the one which was written will be next to be
-//! read, and the one which was read will be next to be written). This approach
-//! avoids the need for memory copies, which improves performance when the
-//! element size is large.
+//! read, and the one which was read will be next to be overwritten). This
+//! approach avoids the need for memory copies, which improves performance when
+//! the element size is large.
 //!
 //! The ping-pong buffer is specifically designed to allow simultaneous reading
 //! and writing.  However, the roles of the two elements can only be safely
@@ -24,20 +24,19 @@
 //! respectively), which automatically update the state of the ping-pong buffer
 //! when they are dropped. Thus, it is important to ensure that these references
 //! are dropped as soon as reading or writing is finished.  Attempting to
-//! acquire a second reference for reading or a second reference for writing
-//! will result in a panic if the first reference of that type has not been
-//! dropped.
+//! acquire a second reference for reading or writing will fail if the first
+//! reference of that type has not been dropped.
 //!
 //! Ordinarily, calls to `read()` and `write()` are as permissive as possible:
-//! `read()` always succeeds unless reading is already in progress, and
-//! `write()` always succeeds unless writing is already in progress. Thus,
-//! depending on the timing of `read()` and `write()` calls, it is possible that
-//! some data which is written may never be read, and other data which is
-//! written may be read multiple times.  (This is an important distinction
-//! between a ping-pong buffer and a two-element ring buffer.)  Alternatively,
-//! the `read_once()` function only returns a `Ref<T>` if it points to data
-//! which has not yet been read, and the `write_no_discard()` function only
-//! returns a `RefMut<T>` if the buffer does not currently contain unread data.
+//! `read()` succeeds unless reading is already in progress, and `write()`
+//! succeeds unless writing is already in progress. Thus, depending on the
+//! timing of `read()` and `write()` calls, certain data which is written may
+//! never be read, and other data which is written may be read multiple times.
+//! (This is an important distinction between a ping-pong buffer and a FIFO
+//! ring buffer.) Alternative behavior is possible using the `read_once()`
+//! function, which only returns a `Ref<T>` if it points to data which has not
+//! yet been read, and the `write_no_discard()` function, which only returns a
+//! `RefMut<T>` if the buffer does not currently contain unread data.
 //!
 //! The memory footprint of a `Buffer<T>` is precisely two of `T` plus one
 //! additional byte (an `AtomicU8`) which is used to synchronize access by the
@@ -54,6 +53,9 @@ use core::sync::atomic;
 
 struct BufferState(atomic::AtomicU8);
 
+/// A `Buffer<T>` consists of two copies of `T` plus on additional byte (an
+/// `AtomicU8`) which is used to synchronize accesses by the producer and
+/// consumer.
 pub struct Buffer<T> {
     ping: UnsafeCell<T>,
     pong: UnsafeCell<T>,
@@ -155,7 +157,6 @@ impl BufferState {
             {
                 flags &= !BufferState::WANT_MODE_CHANGE;
                 flags ^= BufferState::MODE_READ_PING_WRITE_PONG;
-                flags |= BufferState::NEW_DATA_READY_TO_READ;
             }
             flags
         })
@@ -163,10 +164,10 @@ impl BufferState {
     fn release_write(&self) {
         self.release(|mut flags| {
             flags &= !BufferState::LOCK_WRITE;
+            flags |= BufferState::NEW_DATA_READY_TO_READ;
             if flags & BufferState::LOCK_READ == 0 {
                 flags &= !BufferState::WANT_MODE_CHANGE;
                 flags ^= BufferState::MODE_READ_PING_WRITE_PONG;
-                flags |= BufferState::NEW_DATA_READY_TO_READ;
             } else {
                 flags |= BufferState::WANT_MODE_CHANGE;
             }
@@ -177,11 +178,11 @@ impl BufferState {
 
 impl<T: Copy> Buffer<T> {
     /// Returns a new ping-pong buffer with the elements initialized to the
-    /// specified values.
-    pub const fn new(default: T) -> Buffer<T> {
+    /// specified value.
+    pub const fn new(value: T) -> Buffer<T> {
         Buffer {
-            ping: UnsafeCell::new(default),
-            pong: UnsafeCell::new(default),
+            ping: UnsafeCell::new(value),
+            pong: UnsafeCell::new(value),
             state: BufferState::new(),
         }
     }
@@ -189,7 +190,7 @@ impl<T: Copy> Buffer<T> {
 
 impl<T: Default> Buffer<T> {
     /// Returns a new ping-pong buffer with the elements initialized to their
-    /// default values.
+    /// default value.
     pub fn default() -> Buffer<T> {
         Buffer {
             ping: UnsafeCell::default(),

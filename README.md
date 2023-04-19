@@ -4,8 +4,9 @@ element is reserved for writing by the producer, and the other element
 is reserved for reading by the consumer. When writing and reading are
 finished, the roles of the two elements are swapped (i.e. the one
 which was written will be next to be read, and the one which was read
-will be next to be written). This approach avoids the need for memory
-copies, which improves performance when the element size is large.
+will be next to be overwritten). This approach avoids the need for
+memory copies, which improves performance when the element size is
+large.
 
 This ping-pong buffer implementation uses an AtomicU8 for
 synchronization between the producer and consumer, resulting in

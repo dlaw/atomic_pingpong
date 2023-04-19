@@ -79,3 +79,12 @@ fn write_no_discard() {
     b.read();
     *b.write_no_discard().unwrap() = 2;
 }
+
+#[test]
+fn write_no_discard_while_reading() {
+    let b: Buffer<i32> = Buffer::default();
+    let r = b.read().unwrap();
+    *b.write_no_discard().unwrap() = 1;
+    assert!(b.write_no_discard().is_none());
+    drop(r);
+}

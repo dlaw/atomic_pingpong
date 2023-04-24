@@ -34,6 +34,7 @@ fn no_swap_after_interleaved() {
     assert_eq!(*r, 0);
     drop(r);
     assert_eq!(*b.read().unwrap(), 1);
+    assert_eq!(*b.read().unwrap(), 1);
 }
 
 #[test]
@@ -42,6 +43,7 @@ fn no_double_read() {
     let r = b.read().unwrap();
     assert!(b.read().is_none());
     drop(r);
+    assert_eq!(*b.read().unwrap(), 0);
 }
 
 #[test]
@@ -50,6 +52,7 @@ fn no_double_write() {
     let w = b.write().unwrap();
     assert!(b.write().is_none());
     drop(w);
+    assert!(b.write().is_some());
 }
 
 #[test]
@@ -76,8 +79,8 @@ fn write_no_discard() {
     let b: Buffer<i32> = Buffer::default();
     *b.write_no_discard().unwrap() = 1;
     assert!(b.write_no_discard().is_none());
-    b.read();
-    *b.write_no_discard().unwrap() = 2;
+    assert!(b.read().is_some());
+    assert!(b.write_no_discard().is_some());
 }
 
 #[test]
@@ -87,4 +90,7 @@ fn write_no_discard_while_reading() {
     *b.write_no_discard().unwrap() = 1;
     assert!(b.write_no_discard().is_none());
     drop(r);
+    assert!(b.write_no_discard().is_none());
+    assert_eq!(*b.read_once().unwrap(), 1);
+    assert!(b.write_no_discard().is_some());
 }

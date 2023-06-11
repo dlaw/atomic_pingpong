@@ -22,10 +22,12 @@
 //! mutable reference for writing is acquired by calling `Buffer<T>::write()`.
 //! The types returned are smart pointers (`Ref<T>` and `RefMut<T>`,
 //! respectively), which automatically update the state of the ping-pong buffer
-//! when they are dropped. Thus, it is important to ensure that these references
-//! are dropped as soon as reading or writing is finished.  Attempting to
-//! acquire a second reference for reading or writing will fail if the first
-//! reference of that type has not been dropped.
+//! when they are dropped. Attempting to acquire a second reference for reading
+//! or writing will fail if the first reference of that type has not been dropped.
+//! To opt out of automatic reference management, a set of unsafe access functions
+//! are available: `read_unchecked()`, `write_unchecked()`, `release_read()`, and
+//! `release_write()`.  These functions provide reduced runtime overhead but, of
+//! course, care is required to use them safely.
 //!
 //! Ordinarily, calls to `read()` and `write()` are as permissive as possible:
 //! `read()` succeeds unless reading is already in progress, and `write()`
@@ -93,23 +95,21 @@ impl BufferState {
         Self(atomic::AtomicU8::new(0))
     }
     /// If `condition()` is true, atomically update the state byte with
-    /// `action()` (using "Acquire" ordering) and return the previous mode.
+    /// `action()` (using "Acquire" ordering) and return the current mode.
     /// If `condition()` is false, return None without changing the state byte.
     fn lock(&self, condition: fn(u8) -> bool, action: fn(u8) -> u8) -> Option<bool> {
-        match self.0.fetch_update(
+        let mut new_flags = None::<u8>;
+        let _ = self.0.fetch_update(
             atomic::Ordering::Acquire,
             atomic::Ordering::Relaxed,
             |flags| {
                 if condition(flags) {
-                    Some(action(flags))
-                } else {
-                    None
+                    new_flags = Some(action(flags));
                 }
+                new_flags
             },
-        ) {
-            Ok(flags) => Some(flags & Self::MODE_IS_FLIPPED != 0),
-            Err(_) => None,
-        }
+        );
+        new_flags.map(|f| f & Self::MODE_IS_FLIPPED != 0)
     }
     fn lock_read(&self, allow_repeated: bool) -> Option<bool> {
         self.lock(
@@ -167,6 +167,47 @@ impl BufferState {
             flags
         })
     }
+    /// Atomically update the state byte with `action()`
+    /// (using "AcqRel" ordering) and return the current mode.
+    fn release_and_lock(&self, action: fn(u8) -> u8) -> bool {
+        let mut new_flags = 0u8;
+        let _ = self.0.fetch_update(
+            atomic::Ordering::AcqRel,
+            atomic::Ordering::Relaxed,
+            |flags| {
+                new_flags = action(flags);
+                Some(new_flags)
+            },
+        ); // always Ok because the closure always returns Some
+        new_flags & Self::MODE_IS_FLIPPED != 0
+    }
+    fn release_and_lock_read(&self) -> bool {
+        self.release_and_lock(|mut flags| {
+            flags |= Self::LOCK_READ;
+            flags &= !Self::NEW_DATA_READY;
+            if flags & (Self::LOCK_WRITE | Self::WANT_MODE_CHANGE) == Self::WANT_MODE_CHANGE {
+                flags &= !Self::WANT_MODE_CHANGE;
+                flags ^= Self::MODE_IS_FLIPPED;
+            }
+            flags
+        })
+    }
+    fn release_and_lock_write(&self) -> bool {
+        self.release_and_lock(|mut flags| {
+            if flags & Self::LOCK_WRITE != 0 {
+                flags |= Self::NEW_DATA_READY;
+                if flags & Self::LOCK_READ == 0 {
+                    flags &= !Self::WANT_MODE_CHANGE;
+                    flags ^= Self::MODE_IS_FLIPPED;
+                } else {
+                    flags |= Self::WANT_MODE_CHANGE;
+                }
+            } else {
+                flags |= Self::LOCK_WRITE;
+            }
+            flags
+        })
+    }
 }
 
 impl<'a, T> Ref<'a, T> {
@@ -174,9 +215,8 @@ impl<'a, T> Ref<'a, T> {
         let mode = buf.state.lock_read(allow_repeated)?;
         // If we get here, lock_read() succeeded, so it's safe to access the UnsafeCell
         // which is currently designated for reading.
-        let cell = if mode { &buf.ping } else { &buf.pong };
         Some(Ref {
-            ptr: unsafe { &*cell.get() },
+            ptr: unsafe { &*buf.get_pointer(mode, true) },
             state: &buf.state,
         })
     }
@@ -187,9 +227,8 @@ impl<'a, T> RefMut<'a, T> {
         let mode = buf.state.lock_write(allow_repeated)?;
         // If we get here, lock_write() succeeded, so it's safe to access the UnsafeCell
         // which is currently designated for writing.
-        let cell = if mode { &buf.pong } else { &buf.ping };
         Some(RefMut {
-            ptr: unsafe { &mut *cell.get() },
+            ptr: unsafe { &mut *buf.get_pointer(mode, false) },
             state: &buf.state,
         })
     }
@@ -272,6 +311,11 @@ impl<T> Buffer<MaybeUninit<T>> {
 }
 
 impl<T> Buffer<T> {
+    const fn get_pointer(&self, state: bool, read: bool) -> *mut T {
+        // state = false => read ping and write pong
+        // state = true  => read pong and write ping
+        (if state ^ read { &self.ping } else { &self.pong }).get()
+    }
     /// Returns a `Ref<T>` smart pointer providing read-only access to the
     /// ping-pong buffer, or `None` if the `Ref<T>` from a previous call has
     /// not been dropped yet. If a call to `write` previously finished and
@@ -308,6 +352,52 @@ impl<T> Buffer<T> {
     /// yet been dropped.
     pub fn write_no_discard(&self) -> Option<RefMut<T>> {
         RefMut::new(&self, false)
+    }
+    /// When the ping-pong buffer is used safely, reading is
+    /// automatically marked as complete when the `Ref<T>` is dropped.
+    /// This mechanism may be circumvented by forgetting a `Ref<T>` (so
+    /// that its destructor doesn't run), or by acquiring a raw pointer
+    /// from `read_unchecked()`.  In these cases, `release_read()` should be
+    /// called when there will be no more access to the data being read.
+    /// UNSAFE: any existing `Ref<T>` for this buffer, and any reference
+    /// previously returned by `read_unchecked()`, must be forgotten or dropped
+    /// before calling this function.
+    pub unsafe fn release_read(&self) {
+        self.state.release_read();
+    }
+    /// When the ping-pong buffer is used safely, writing is
+    /// automatically marked as complete when the `RefMut<T>` is dropped.
+    /// This mechanism may be circumvented by forgetting a `RefMut<T>` (so
+    /// that its destructor doesn't run), or by acquiring a raw pointer
+    /// from `write_unchecked()`.  In these cases, `release_write()` should be
+    /// called when there will be no more access to the data being written.
+    /// UNSAFE: any existing `RefMut<T>` for this buffer, and any reference
+    /// previously returned by `write_unchecked()`, must be forgotten or dropped
+    /// before calling this function.
+    pub unsafe fn release_write(&self) {
+        self.state.release_write();
+    }
+    /// `Buffer<T>::read_unchecked()` is logically equivalent to
+    /// `Buffer<T>::release_read()` followed by `&*Buffer<T>::read().unwrap()`.
+    /// Using `read_unchecked()` results in reduced execution time, because
+    /// only one atomic operation is needed (rather than two), and success is
+    /// guaranteed (so there is no need to deal with an `Option<Ref<T>>`).
+    /// UNSAFE: any existing `Ref<T>` for this buffer, and any reference
+    /// previously returned by `read_unchecked()`, must be forgotten or dropped
+    /// before calling this function.
+    pub unsafe fn read_unchecked(&self) -> &T {
+        &*self.get_pointer(self.state.release_and_lock_read(), true)
+    }
+    /// `Buffer<T>::write_unchecked()` is logically equivalent to
+    /// `Buffer<T>::release_write()` followed by `&*Buffer<T>::write().unwrap()`.
+    /// Using `write_unchecked()` results in reduced execution time, because
+    /// only one atomic operation is needed (rather than two), and success is
+    /// guaranteed (so there is no need to deal with an `Option<RefMut<T>>`).
+    /// UNSAFE: any existing `RefMut<T>` for this buffer, and any reference
+    /// previously returned by `write_unchecked()`, must be forgotten or dropped
+    /// before calling this function.
+    pub unsafe fn write_unchecked(&self) -> &mut T {
+        &mut *self.get_pointer(self.state.release_and_lock_write(), false)
     }
 }
 

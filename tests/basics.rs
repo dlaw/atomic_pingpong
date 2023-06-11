@@ -94,3 +94,46 @@ fn write_no_discard_while_reading() {
     assert_eq!(*b.read_once().unwrap(), 1);
     assert!(b.write_no_discard().is_some());
 }
+
+#[test]
+fn release_read() {
+    let b: Buffer<i32> = Buffer::default();
+    let r = b.read().unwrap();
+    core::mem::forget(r);
+    assert!(b.read().is_none());
+    unsafe { b.release_read() };
+    assert!(b.read().is_some());
+}
+
+#[test]
+fn release_write() {
+    let b: Buffer<i32> = Buffer::default();
+    let w = b.write().unwrap();
+    core::mem::forget(w);
+    assert!(b.write().is_none());
+    unsafe { b.release_write() };
+    assert!(b.write().is_some());
+}
+
+#[test]
+fn read_unchecked() {
+    let b: Buffer<i32> = Buffer::default();
+    assert_eq!(unsafe { *b.read_unchecked() }, 0);
+    *b.write().unwrap() = 1;
+    assert_eq!(unsafe { *b.read_unchecked() }, 1);
+    *b.write().unwrap() = 2;
+    unsafe { b.release_read() };
+    assert_eq!(*b.read().unwrap(), 2);
+}
+
+#[test]
+fn write_unchecked_and_read_once() {
+    let b: Buffer<i32> = Buffer::default();
+    assert!(b.read_once().is_none());
+    unsafe { *b.write_unchecked() = 1 };
+    assert!(b.read_once().is_none());
+    unsafe { *b.write_unchecked() = 2 };
+    assert_eq!(*b.read_once().unwrap(), 1);
+    unsafe { b.release_write() };
+    assert_eq!(*b.read_once().unwrap(), 2);
+}
